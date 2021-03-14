@@ -1,40 +1,40 @@
 # external-sort
 This code was developed as part of an interview process. It implements an external sort of text files.
 
-Summary of the utility of this application. A very large input text file is broken down into small "chunks" that can be sorted in memory (concurrently), then saved to individual files. These chunks are then merged (concurrently) into larger files, using an in-memory heap to take the smallest elements from the top of the pre-sorted chunks. Thus a very large sort can be accomplished; where space is limited by persistent storage (disk), not RAM.
+Summary of the utility of this application. A very large input text file(s) is broken down into small "chunks" that can be sorted in memory (concurrently), then saved to individual files. These chunks are then merged (concurrently) into larger files, using an in-memory heap to take the smallest elements from the top of the pre-sorted chunks. Thus a very large sort can be accomplished; where space is limited by persistent storage (disk), not RAM.
 ## Status
-I hit the (arbitrary) time limit I set for working on this. It generally appears to function and solve the problem, but could use at least an additional code review/refactor, as well as test functions. Also, this README could use another review. The hierarchy output was the last thing added and only had a cursory look to verify.
+I hit the (arbitrary) time limit I set for working on this. It generally appears to function and solve the problem, but could use at least an additional code review/refactor, as well as test functions. Also, this README could use another review. 
 ## Problem Statement (as provided)
 Please write an algorithm in Golang or Rust, utilizing concurrency, that sorts the contents of, /n delimited, txt files into nested alphanumeric files at a specified directory. If any file reaches a threshold size, create a folder with that index and sort by the subsequent character into subfiles. Internally sort all files alphanumerically. Finally, determine if an input file has already been sorted.
 ## Problem Restatement
 There is some ambiguity in the statement as written, so here is my interpretation and additional statements of intent, as well as limitations.
 * Assumptions and limitations
-    * There is plenty of disk space; enough to hold at least 3x the combined size of input files. 
+    * There is plenty of disk space; enough to hold at least 3x the combined size of input files. (3x because there are: the inputn (I'm moving/saving these as they are processed), intermedidate output files, and the final sort. By saving the final sort, more input files can be processed and added to the output.)
     * The threshold-size, combined with threads, is really a way of capping memory (RAM) use. Thus intermediate (sorted) output files will be of size (threshold_size/(threads + 1)), to limit in-use memory to ~threhsold_size.
     * Empty lines will be dropped, as will duplicates. This is a simplication to eliminate the corner cases where a single repeating entry is larger than threshold size, in which case it would not be clear what the directory or file name output should be. Plus I think this is fitting with the problem. The application of this code likely involves storing user IDs, keys for a hash map, etc., and thus you don't want duplicates. If duplicates were desired, this could be implemented with a sentinal character/string at EOL followed by a count, and some filename schema that indicated a repeat.
     * If any single line is longer than threshold-size, print an error and drop that line. Another elimination of a corner case, that should likely only exist for corrupt files or malformed input.
 * Write a Golang CLI program that takes inputs of:
     * input-directory - Contains one of more input text files, \n delimited.
-    * output-directory - Parsed and sorted data is stored here in nested alphanumeric files.
-    * reset - Clear existing input and output files, persisted data, everything.
+    * output-directory - Multiple directories are here for: saving processed input files, saving a list of processed files as JSON, chunking input files, merging chunks, and the hierarchy.
+    * reset - Remove the output directory and all contents; re-created on start.
     * threads - number of threads (GO routines) to run.
-    * threshold-size - Maximum file size (bytes) for files in the output-directory. Note this is a maximum; some files may be smaller.
+    * threshold-size - Maximum file size (bytes) for files in the output-directory. Note this is ~maximum; some files may be smaller. It is approximately maximum, as the algorithm does not back-track; it processes input until the threshold is exceeded, writes that output, then starts a new file. So the maximum is really thresholld-size + (the maximum on any input token).
 * Implementation notes:
     * Multiple calls using the same output-directory will add to existing output.
     * Provide additional input parameter(s) that will generate example input, for testing.
 * Additional considerations for a production app that I am not going to consider further:
     * The application will keep a history of input filenames, and does not re-process the same **file name**. If input filenames are not guaranteed to be unique, other information needs persisted. Options: filename and created/modified time, filename and size, or filename and checksum (most robust, but also most expensive.)
-    * Delete input files after successful processing? Maybe, do they exist somewhere else? Is history needed? I will move them when processed..
+    * Delete input files after successful processing? Maybe, do they exist somewhere else? Is history needed? I will move them when processed.
     * The list of processed files is kept in memory. I'm assuming the number of files is small. If that is not the case, then this needs additional work.
-    * There are many notes in the code about potential optimizations; these need considered.
+    * There are many notes in the code about potential optimizations; these need considered. Optimizing performance is going to be hardware specific, and a function of: threads, threshold-size, default linux file size and optimizing the maxOpenFiles contstant, channel buffer sizes, etc. Also, native GO sort and heap efficiency need investigated. See code notes.
 ## Strategy
-* Using threads number of GO routines, read in (threshold_size/(threads + 1)) portions of unprocessed input file(s), sort, and write to chunked/sorted output files. 
+* Using threads number of GO routines, read in (threshold_size/(threads + 1)) portions of unprocessed input file(s), sort (in memory using GO sort package), and write to chunked/sorted output files. 
     * Repeat until all input files processed.
     * Move input files into a processed folder (This is safe, but the use case may allow deleting them.)
-* Open up to maxOpenFiles chunked/sorted files per GO routine, build a min-heap of the first item from each file, pop min from the heap and write to output file. Note these files are NOT limited to threshold size. 
+* Open up to maxOpenFiles chunked/sorted files per GO routine, build a min-heap of the first item from each file, pop min from the heap and write to output file. Note these files are NOT limited to threshold size. Remove a token from the file from which the POP'ed item came and add to the heap.
     * Repeat this step until all chunked/sorted files are processed.
-    * When done there there be threads number of merged/sorted files.
-    * Keep chunked/sorted files, so additional input can be added.
+    * When done there there be threads number, or fewer, of merged/sorted files.
+    * Keep merged/sorted files, so additional input can be added.
     * Once there are threads or fewer files, write output into a nested alphanumeric hierarchy.
 * Persist input file names as JSON list.
 * Processing additional files is just a matter of verifying the file is not in the persisted list, and if not, repeating this process. 
@@ -55,11 +55,10 @@ pqrs
 The resulting file structure will look like:
 ```
 ./a
+    file with contents "aaaa\naaab\n"
     ./a
-        ./a
-            file with contents "aaaa\naaab\n"
-        ./b
-            file with contents "aabb\naabc\n" 
+    ./b
+        file with contents "aabb\naabc\n" 
 ./d
     file with contents "defg\nhijk\n"
 ./l       
@@ -70,7 +69,7 @@ I *think* this is what is being asked for, but am not certain. I'm also generati
 This seems like a good approach, but I'm not confident it couldn't be more optimal. But I spent enough time getting this far, and for the purpose of an interview coding exercise, I am ready to move on to code. For something mission critical, I'd do more research, while using this as a starting point.
 * Are the sort and heap packages efficient?
 * Are there properties of the input data that make different sorting algorithms better for this application?
-* Is the input data provided in the most efficient manner for this application? I.E. Is it random, when sequential would allow for faster sorting? (Random data is desireable in applications where the possible code space is much larger than the used code space, as corrupttion can be detected. But sequential data may allow faster processing.)
+* Is the input data provided in the most efficient manner for this application? I.E. Is it random, when sequential would allow for faster sorting? (Random data is desireable in applications where the possible code space is much larger than the used code space, as corrupttion can be detected. But sequential data would allow faster processing.)
 * I will either skip tests entirely, or have something very minimal, as the testing alone to verify production quality would be a significant amount of work.
 ## Requirements
 * You need to have docker (engine and compose) installed. This was tested with client 20.10.1 and server 19.03.13.
@@ -86,7 +85,7 @@ git clone https://github.com/paulfdunn/external-sort.git
 ./dockersetup.sh
 ```
 ## Using the application
-Here is output from an example terminal session using the Docker container. This example: runs external-sort, generating its own test data, and dumps the head/tail of the output.
+Here is output from an example terminal session using the Docker container. This example: builds a Docker container, runs external-sort, generating its own test data, and dumps the head/tail of the output.
 ```
 paulfdunn@penguin:~/go/src/external-sort$ docker build -t external-sort:external-sort .
 Sending build context to Docker daemon  3.276MB

@@ -11,7 +11,6 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -20,6 +19,11 @@ import (
 	"strings"
 	"sync"
 )
+
+type mergedChunkedWorkItem struct {
+	filePaths []string
+	id        string
+}
 
 type sortHeap []sortHeapItem
 type sortHeapItem struct {
@@ -41,21 +45,21 @@ const (
 
 const (
 	// inputLineBuffer is the channel buffer for feeding data from input files to sort/save threads.
-	// May need optimized.
+	// May need optimized; highly dependent on persistent storage speed vs host capability.
 	inputLineBuffer = 1000
 	// Linux generally limits the number of open files for a process to 1024; leave plenty of margin.
 	// Changing the linux default and increasing this value is likely to increase performance.
 	maxOpenFiles = 800
-	// writeBufferSize is the buffer size used when writing files. May need optimized.
+	// writeBufferSize is the buffer size used when writing files. May need optimized; highly
+	// dependent on persistent storage speed
 	writeBufferSize = 4096
 )
 
 var (
-	appPath           string
 	defaultWorkingDir = filepath.Join(os.TempDir(), "external-sort")
 	defaultInputDir   = filepath.Join(defaultWorkingDir, "input")
 	inputDir          = flag.String("inputdir", defaultInputDir,
-		fmt.Sprintf("Directory containing input files, defaults to: ./%s", defaultInputDir))
+		fmt.Sprintf("Directory containing input files, defaults to: %s", defaultInputDir))
 	inputFile  = "testInput.txt"
 	workingDir = flag.String("workingdir", defaultWorkingDir,
 		fmt.Sprintf("Directory containing output files, defaults to: ./%s", defaultWorkingDir))
@@ -67,43 +71,38 @@ var (
 		fmt.Sprintf("Threshold size determines the output file size, in bytes. "+
 			"The actual output will be up to one entry longer than this value. "+
 			"Default: %d", defaultThresoldSize))
-
-	chunkedSortedDir         = filepath.Join(*workingDir, "chunked-sorted")
-	hierarchyDir             = filepath.Join(*workingDir, "hierarchy")
-	mergedSortedDir          = filepath.Join(*workingDir, "merged-sorted")
-	processedInputDir        = filepath.Join(*workingDir, "processed-input")
-	processedFilesPath       = filepath.Join(*workingDir, "processed-inputs.txt")
-	chunkedSortedFileNameFmt = filepath.Join(chunkedSortedDir, "chunked-sorted_%d.txt")
-	mergedSortedFileNameFmt  = filepath.Join(mergedSortedDir, "merged-sorted_%s.txt")
-	allOutputDirs            = []string{*workingDir, chunkedSortedDir, mergedSortedDir,
+	// Output directories
+	chunkedSortedDir   = filepath.Join(*workingDir, "chunked-sorted")
+	hierarchyDir       = filepath.Join(*workingDir, "hierarchy")
+	mergedSortedDir    = filepath.Join(*workingDir, "merged-sorted")
+	processedInputDir  = filepath.Join(*workingDir, "processed-input")
+	processedFilesPath = filepath.Join(*workingDir, "processed-inputs.txt")
+	allOutputDirs      = []string{*workingDir, chunkedSortedDir, mergedSortedDir,
 		processedInputDir, hierarchyDir}
 
+	// Format statements to generate file names.
+	chunkedSortedFileNameFmt = filepath.Join(chunkedSortedDir, "chunked-sorted_%d.txt")
+	mergedSortedFileNameFmt  = filepath.Join(mergedSortedDir, "merged-sorted_%s.txt")
+
+	// Names of input files processed in prior runs.
 	processedFiles []string
 )
 
 func main() {
-
+	var err error
 	defer func() {
 		if err := recover(); err != nil {
 			fmt.Printf("Error: %+v\n%+v\n", err, string(debug.Stack()))
 		}
 	}()
 
-	exe, err := os.Executable()
-	if err != nil {
-		log.Fatalf("FATAL: Could not find executable path.\n")
-	}
-	appPath = filepath.Dir(exe)
-
 	flag.Parse()
-
 	if reset != nil && *reset {
 		err := doReset()
 		if err != nil {
 			os.Exit(int(exitResetError))
 		}
 	}
-
 	if *inputDir == defaultInputDir {
 		err := makeDirs([]string{defaultInputDir})
 		if err != nil {
@@ -114,13 +113,11 @@ func main() {
 	if err != nil {
 		os.Exit(int(exitDirCreateError))
 	}
-
 	if threads != nil && *threads <= 0 {
 		one := 1
 		threads = &one
 		fmt.Println("Warning: threads was provided with a value <=0; it has been modified to 1.")
 	}
-
 	if testFileEntries != nil && *testFileEntries > 0 {
 		err := makeTestFile(*testFileEntries, filepath.Join(*inputDir, inputFile))
 		if err != nil {
@@ -157,12 +154,12 @@ func (h sortHeap) Swap(i, j int) {
 }
 
 func (h *sortHeap) Push(x interface{}) {
-	// Push and Pop use pointer receivers because they modify the slice's length,
-	// not just its contents.
+	// Pointer receiver required to modify slice.
 	*h = append(*h, x.(sortHeapItem))
 }
 
 func (h *sortHeap) Pop() interface{} {
+	// Pointer receiver required to modify slice.
 	old := *h
 	n := len(old)
 	x := old[n-1]
@@ -179,7 +176,6 @@ func chunkInputFiles() error {
 	for i := range outputFiles {
 		filePathChan <- outputFiles[i]
 	}
-
 	lineChan := make(chan string, inputLineBuffer)
 	errorChan := make(chan error, *threads)
 	var wg sync.WaitGroup
@@ -220,6 +216,9 @@ func chunkInputFiles() error {
 		defer f.Close()
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
+			if len(scanner.Bytes()) >= int(*thresholdSize) || len(scanner.Bytes()) == 0 {
+				continue
+			}
 			lineChan <- scanner.Text() + "\n"
 		}
 		if err := scanner.Err(); err != nil {
@@ -246,23 +245,24 @@ func chunkInputFiles() error {
 	return nil
 }
 
-func chunkInputFilesWorker(lines <-chan string, filePath <-chan string,
+// chunkInputFilesWorker should run in a GO routine, and will take up to thresholdSize lines of input
+// (in bytes), sort (in memory), and save to a file name pulled from filePathChan. Input lines that
+// are blank are dropped.
+func chunkInputFilesWorker(lines <-chan string, filePathChan <-chan string,
 	errc chan<- error, wg *sync.WaitGroup) {
 	buf := []string{}
 	bytes := int64(0)
 
-	var lastLine string
 	for line := range lines {
-		// Drop blanks and duplicates.
-		if line == "" || line == lastLine {
+		// Drop blanks; duplicates cannot yet be determined as the data is not yet sorted.
+		if line == "" {
 			continue
 		}
-		lastLine = line
 		bytes += int64(len(line))
 		buf = append(buf, line)
 		if bytes >= *thresholdSize {
-			fp := <-filePath
-			err := chunkSave(fp, buf, true)
+			fp := <-filePathChan
+			err := dataBufSave(fp, buf, true)
 			if err != nil {
 				errc <- err
 				break
@@ -272,8 +272,8 @@ func chunkInputFilesWorker(lines <-chan string, filePath <-chan string,
 		}
 	}
 	if len(buf) != 0 {
-		fp := <-filePath
-		err := chunkSave(fp, buf, true)
+		fp := <-filePathChan
+		err := dataBufSave(fp, buf, true)
 		if err != nil {
 			errc <- err
 		}
@@ -281,7 +281,10 @@ func chunkInputFilesWorker(lines <-chan string, filePath <-chan string,
 	wg.Done()
 }
 
-func chunkSave(filepath string, buf []string, doSort bool) error {
+// dataBufSave will save a buffer to the specified filepath; doing an in-memory sort prior to
+// saving, if requested. The input buffer may or may not be impacted, depending on how the
+// functions; assume the input buffer is modified.
+func dataBufSave(filepath string, buf []string, doSort bool) error {
 	f, err := os.Create(filepath)
 	if err != nil {
 		fmt.Printf("Error: creating input file, error: %+v\n", err)
@@ -301,6 +304,7 @@ func chunkSave(filepath string, buf []string, doSort bool) error {
 	return nil
 }
 
+// doReset will delete all output directories in workingDir.
 func doReset() error {
 	err := os.RemoveAll(*workingDir)
 	if err != nil {
@@ -310,6 +314,7 @@ func doReset() error {
 	return nil
 }
 
+// makeDirs will create all directories, including parents if required, in dirs.
 func makeDirs(dirs []string) error {
 	for i := range dirs {
 		err := os.MkdirAll(dirs[i], 0777)
@@ -321,25 +326,44 @@ func makeDirs(dirs []string) error {
 	return nil
 }
 
-func makeHierarchy(baseDir string, smallestValue string, lastSmallestValue string) (string, error) {
+// makeHierarchy will compare two tokens (after removing leading/trailing whitespace), find
+// the first different character, then create nested directories under baseDir for each leading
+// character that is the same.
+// The return value is a path of the created directories and filename of the currentToken
+// starting at the first different character. (Think page headings in a dictionary, and the
+// first word on the page.)
+// I.E. currentToken=aab123, nextToken=aac456, the result is creating /baseDir/a/a and returning
+// a string "/baseDir/a/a/b123"
+func makeHierarchy(baseDir string, currentToken string, nextToken string) (string, error) {
+	ct := strings.TrimSpace(currentToken)
+	if len(ct) == 0 {
+		err := fmt.Errorf("makeHierarchy currentToken was zero length")
+		fmt.Printf("%+v\n", err)
+		return "", err
+	}
+	nt := strings.TrimSpace(nextToken)
 	indexNE := 0
-	min := len(smallestValue)
-	if min > len(lastSmallestValue) {
-		min = len(lastSmallestValue)
+	min := len(nt)
+	if min > len(ct) {
+		min = len(ct)
 	}
 	for indexNE = 0; indexNE < min; indexNE++ {
-		if smallestValue[indexNE] != lastSmallestValue[indexNE] {
+		if nt[indexNE] != ct[indexNE] {
 			break
 		}
 	}
-	lastTrim := strings.TrimSpace(lastSmallestValue)
-	pth := filepath.Join(baseDir,
-		filepath.Join(strings.Split(lastTrim[0:indexNE], "")...))
+	difChars := string(ct[0])
+	if indexNE > 0 {
+		difChars = ct[0:indexNE]
+	}
+	pth := filepath.Join(baseDir, filepath.Join(strings.Split(difChars, "")...))
 	pths := []string{pth}
 	err := makeDirs(pths)
-	return filepath.Join(pth, lastTrim[indexNE:]), err
+	return filepath.Join(pth, ct[indexNE:]), err
 }
 
+// makeTestFile will make an input file for testing, of length entries, that is filled with random
+// 32 character strings.
 func makeTestFile(entries int64, filePath string) error {
 	f, err := os.Create(filePath)
 	if err != nil {
@@ -365,11 +389,10 @@ func makeTestFile(entries int64, filePath string) error {
 	return err
 }
 
-type mergedChunkedWorkItem struct {
-	filePaths []string
-	id        string
-}
-
+// mergeChunkedFiles will process input files (chunked into thresholdSize, and pre-sorted), into less
+// than threads number of output files. A heap is build from the first line of each file, the heap POP'd,
+// that line written to the output file, a line added to the heap from the source of the last POP'd
+// line, and this repeated, until all input files have been combined into sorted output.
 func mergeChunkedFiles() error {
 	var wg sync.WaitGroup
 	dirs := []string{chunkedSortedDir, mergedSortedDir}
@@ -390,11 +413,14 @@ func mergeChunkedFiles() error {
 			errorChan := make(chan error, *threads)
 			mergeChunkedFilesWorkerStart(mergedChunkedWorkItemChan, errorChan, &wg)
 
+			// fps is a slice of paths to all files needing processed.
 			fps := make([]string, len(files))
 			for i := range files {
 				fps[i] = filepath.Join(dir, files[i].Name())
 			}
 			filesPerThread := 1 + len(files)/(*threads)
+			// TODO: upate this so that threads number of output files remain, to enable new data
+			// to be added more efficiently.
 			if filesPerThread > maxOpenFiles {
 				filesPerThread = maxOpenFiles
 			} else if filesPerThread <= 1 {
@@ -407,6 +433,7 @@ func mergeChunkedFiles() error {
 				// fmt.Printf("mergeChunkedFiles threads: %d, filesPerThread: %d\n", *threads, filesPerThread)
 				mcwi := mergedChunkedWorkItem{fps[0:filesPerThread], strconv.Itoa(id)}
 				mergedChunkedWorkItemChan <- mcwi
+				// id is a unique ID for each output file,
 				id++
 				fps = fps[filesPerThread:]
 				if len(fps) == 0 {
@@ -432,6 +459,7 @@ func mergeChunkedFiles() error {
 	return nil
 }
 
+// mergeChunkedFilesWorkerStart starts the workers in GO routines.
 func mergeChunkedFilesWorkerStart(mergedChunkedWorkItemChan <-chan mergedChunkedWorkItem,
 	errc chan<- error, wg *sync.WaitGroup) {
 	for i := 0; i < *threads; i++ {
@@ -444,33 +472,34 @@ func mergeChunkedFilesWorkerStart(mergedChunkedWorkItemChan <-chan mergedChunked
 	}
 }
 
+// mergeChunkedFilesWorker should be called in a GO routine and is used to do the work of
+// mergeChunkedFiles.
 func mergeChunkedFilesWorker(instance int, mergedChunkedWorkItemChan <-chan mergedChunkedWorkItem,
 	errc chan<- error) {
 	for mcwi := range mergedChunkedWorkItemChan {
 		fo, err := os.Create(fmt.Sprintf(mergedSortedFileNameFmt, mcwi.id))
 		if err != nil {
-			nerr := fmt.Errorf("Error: creating output file, error: %+v", err)
+			nerr := fmt.Errorf("creating output file, error: %+v", err)
 			errc <- nerr
 			return
 		}
-		defer fo.Close()
 		w := bufio.NewWriterSize(fo, writeBufferSize)
 
 		//build a min-heap of the first item from each file, pop min from the heap into a buffer,
 		//repeat and save output to file
 		scanners := make([]*bufio.Scanner, len(mcwi.filePaths))
+		fileHandles := make([]*os.File, len(mcwi.filePaths))
 		hp := &sortHeap{}
 		heap.Init(hp)
 		for i := range mcwi.filePaths {
 			// fmt.Printf("processing input file: %s\n", mcwi.filePaths[i])
-			f, err := os.Open(mcwi.filePaths[i])
+			fileHandles[i], err = os.Open(mcwi.filePaths[i])
 			if err != nil {
 				fmt.Printf("Error: opening input file: %s, error: %+v\n", mcwi.filePaths[i], err)
 				errc <- err
 				return
 			}
-			defer f.Close()
-			scanners[i] = bufio.NewScanner(f)
+			scanners[i] = bufio.NewScanner(fileHandles[i])
 			scanners[i].Scan()
 			if err := scanners[i].Err(); err != nil {
 				fmt.Printf("Error: reading input file, error: %+v\n", err)
@@ -483,30 +512,32 @@ func mergeChunkedFilesWorker(instance int, mergedChunkedWorkItemChan <-chan merg
 
 		buf := []string{}
 		bytes := int64(0)
-		lastSmallestValue := ""
 		for {
 			if hp.Len() == 0 {
 				break
 			}
-
 			smallest := heap.Pop(hp).(sortHeapItem)
 			buf = append(buf, smallest.value)
 			bytes += int64(len(smallest.value))
 			if bytes > *thresholdSize || hp.Len() == 0 {
-				fp, err := makeHierarchy(hierarchyDir, smallest.value, lastSmallestValue)
+				startToken := buf[0]
+				nextToken := ""
+				if len(buf) >= 2 {
+					nextToken = buf[1]
+				}
+				fp, err := makeHierarchy(hierarchyDir, startToken, nextToken)
 				if err != nil {
 					errc <- err
 					return
 				}
-				chunkSave(fp, buf, false)
+				dataBufSave(fp, buf, false)
 				buf = []string{}
 				bytes = 0
 			}
-			lastSmallestValue = smallest.value
 
 			_, err := w.WriteString(smallest.value)
 			if err != nil {
-				nerr := fmt.Errorf("Error: writing input file, error: %+v", err)
+				nerr := fmt.Errorf("writing input file, error: %+v", err)
 				errc <- nerr
 				return
 			}
@@ -526,17 +557,20 @@ func mergeChunkedFilesWorker(instance int, mergedChunkedWorkItemChan <-chan merg
 
 		err = w.Flush()
 		if err != nil {
-			nerr := fmt.Errorf("Error: flushing output file, error: %+v", err)
+			nerr := fmt.Errorf("flushing output file, error: %+v", err)
 			errc <- nerr
 			return
 		}
-
+		fo.Close()
 		for i := range mcwi.filePaths {
 			os.Remove(mcwi.filePaths[i])
+			fileHandles[i].Close()
 		}
 	}
 }
 
+// processedFilesGet gets a list of files names that were already processed. These files will
+// not be processed again.
 func processedFilesGet() ([]string, error) {
 	if _, err := os.Stat(processedFilesPath); os.IsNotExist(err) {
 		return []string{}, nil
@@ -558,6 +592,7 @@ func processedFilesGet() ([]string, error) {
 	return pf, nil
 }
 
+// processedFilesSave persists the list of processed input file names as a JSON object.
 func processedFilesSave(processedFiles []string) error {
 	b, err := json.Marshal(processedFiles)
 	if err != nil {
@@ -574,6 +609,11 @@ func processedFilesSave(processedFiles []string) error {
 	return nil
 }
 
+// outputFileNames will generate a slice of files names used to store the output of the input
+// chunking process. These need generated in advance, since the chunking is occuring in threads,
+// which don't have visibility to what file(s) any other thread generated. A more complicated
+// alternative would be to have threads communcate about generated file names, but that overcomplicates
+// things.
 func outputFileNames(format string, dir string) ([]string, error) {
 	files, err := ioutil.ReadDir(dir)
 	if err != nil {
@@ -584,8 +624,9 @@ func outputFileNames(format string, dir string) ([]string, error) {
 	for _, file := range files {
 		totalSize += file.Size()
 	}
-	// Each thread will require an additional file for rounding errors.
-	numOutputFiles := int64(*threads+1) + (totalSize / *thresholdSize)
+	// Each thread will require additional files due to rounding error and input not breaking
+	// on increments of threshold-size.
+	numOutputFiles := int64(*threads+1) + (1 + totalSize / *thresholdSize)
 	fmt.Printf("input files size: %d, resulting files:~ %d\n", totalSize, numOutputFiles)
 	names := make([]string, numOutputFiles+1)
 	for i := int64(0); i < numOutputFiles; i++ {
@@ -595,11 +636,13 @@ func outputFileNames(format string, dir string) ([]string, error) {
 	return names, nil
 }
 
+// uniqueID is used to generate 16 byte (32 character) ID's; as a UUID (includeHuphens) or
+// hex string. Note these are hex strings; they do not include all alphanumeric characters.
 func uniqueID(includeHyphens bool) (id string, err error) {
 	idBin := make([]byte, 16)
 	_, err = rand.Read(idBin)
 	if err != nil {
-		err := fmt.Errorf("Error: creating unique binary ID, error: %+v", err)
+		err := fmt.Errorf("creating unique binary ID, error: %+v", err)
 		fmt.Printf("%+v\n", err)
 		return "", err
 	}
