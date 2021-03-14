@@ -492,7 +492,7 @@ func mergeChunkedFilesWorker(instance int, mergedChunkedWorkItemChan <-chan merg
 			smallest := heap.Pop(hp).(sortHeapItem)
 			buf = append(buf, smallest.value)
 			bytes += int64(len(smallest.value))
-			if bytes > *thresholdSize {
+			if bytes > *thresholdSize || hp.Len() == 0 {
 				fp, err := makeHierarchy(hierarchyDir, smallest.value, lastSmallestValue)
 				if err != nil {
 					errc <- err
