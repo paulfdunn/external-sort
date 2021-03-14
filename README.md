@@ -3,7 +3,7 @@ This code was developed as part of an interview process. It implements an extern
 
 Summary of the utility of this application. A very large input text file(s) is broken down into small "chunks" that can be sorted in memory (concurrently), then saved to individual files. These chunks are then merged (concurrently) into larger files, using an in-memory heap to take the smallest elements from the top of the pre-sorted chunks. Thus a very large sort can be accomplished; where space is limited by persistent storage (disk), not RAM.
 ## Status
-I hit the (arbitrary) time limit I set for working on this. It generally appears to function and solve the problem, but could use at least an additional code review/refactor, as well as test functions. Also, this README could use another review. 
+I hit the (arbitrary) time limit I set for working on a problem that was provided as part of an interview. It generally appears to function and solve the problem. But I did not write tests, as that was going to be significant additional work, and I felt the code written is sufficient for interview purposes.  
 ## Problem Statement (as provided)
 Please write an algorithm in Golang or Rust, utilizing concurrency, that sorts the contents of, /n delimited, txt files into nested alphanumeric files at a specified directory. If any file reaches a threshold size, create a folder with that index and sort by the subsequent character into subfiles. Internally sort all files alphanumerically. Finally, determine if an input file has already been sorted.
 ## Problem Restatement
@@ -66,7 +66,7 @@ The resulting file structure will look like:
 ```
 I *think* this is what is being asked for, but am not certain. I'm also generating a single output file.
 ## Concerns
-This seems like a good approach, but I'm not confident it couldn't be more optimal. But I spent enough time getting this far, and for the purpose of an interview coding exercise, I am ready to move on to code. For something mission critical, I'd do more research, while using this as a starting point.
+This seems like a good approach, but I'm not confident it couldn't be more optimal. I spent enough time getting this far, and for the purpose of an interview coding exercise, I feel this is good enough. For something mission critical, I'd do more research, while using this as a starting point.
 * Are the sort and heap packages efficient?
 * Are there properties of the input data that make different sorting algorithms better for this application?
 * Is the input data provided in the most efficient manner for this application? I.E. Is it random, when sequential would allow for faster sorting? (Random data is desireable in applications where the possible code space is much larger than the used code space, as corrupttion can be detected. But sequential data would allow faster processing.)
