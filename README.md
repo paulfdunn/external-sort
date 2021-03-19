@@ -2,6 +2,8 @@
 This code was developed as part of an interview process. It implements an external sort of text files.
 
 Summary of the utility of this application. A very large input text file(s) is broken down into small "chunks" that can be sorted in memory (concurrently), then saved to individual files. These chunks are then merged (concurrently) into larger files, using an in-memory heap to take the smallest elements from the top of the pre-sorted chunks. Thus a very large sort can be accomplished; where space is limited by persistent storage (disk), not RAM.
+
+The context of this repo is as a "take home test" for an interview. My take of the expectations is this: better than white board code, but less than a full production app. In particular, tests will be skipped, or minimal at best.
 ## Status
 I hit the (arbitrary) time limit I set for working on a problem that was provided as part of an interview. It generally appears to function and solve the problem. But I did not write tests, as that was going to be significant additional work, and I felt the code written is sufficient for interview purposes.  
 ## Problem Statement (as provided)
