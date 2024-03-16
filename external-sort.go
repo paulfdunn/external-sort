@@ -466,7 +466,7 @@ func mergeChunkedFilesWorkerStart(mergedChunkedWorkItemChan <-chan mergedChunked
 		wg.Add(1)
 		go func(instance int, mergedChunkedWorkItemChan <-chan mergedChunkedWorkItem,
 			errc chan<- error, wg *sync.WaitGroup) {
-			mergeChunkedFilesWorker(instance, mergedChunkedWorkItemChan, errc)
+			mergeChunkedFilesWorker(mergedChunkedWorkItemChan, errc)
 			wg.Done()
 		}(i, mergedChunkedWorkItemChan, errc, wg)
 	}
@@ -474,7 +474,7 @@ func mergeChunkedFilesWorkerStart(mergedChunkedWorkItemChan <-chan mergedChunked
 
 // mergeChunkedFilesWorker should be called in a GO routine and is used to do the work of
 // mergeChunkedFiles.
-func mergeChunkedFilesWorker(instance int, mergedChunkedWorkItemChan <-chan mergedChunkedWorkItem,
+func mergeChunkedFilesWorker(mergedChunkedWorkItemChan <-chan mergedChunkedWorkItem,
 	errc chan<- error) {
 	for mcwi := range mergedChunkedWorkItemChan {
 		fo, err := os.Create(fmt.Sprintf(mergedSortedFileNameFmt, mcwi.id))
